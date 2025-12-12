@@ -8,6 +8,12 @@ import time
 import numpy as np
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
+import io
+
+# Google Drive API
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # =============================================================================
 # 🔐 보안 설정 (Security Setup)
@@ -17,8 +23,12 @@ try:
     NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
     NOTION_DATABASE_ID = st.secrets["NOTION_DATABASE_ID"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-except (FileNotFoundError, KeyError):
-    st.error("⚠️ API 키가 설정되지 않았습니다.")
+    GDRIVE_FOLDER_ID = st.secrets["GDRIVE_FOLDER_ID"]
+    
+    # 서비스 계정 JSON 키 (secrets.toml에서 로드)
+    GDRIVE_SERVICE_ACCOUNT = st.secrets["GDRIVE_SERVICE_ACCOUNT"]
+except (FileNotFoundError, KeyError) as e:
+    st.error(f"⚠️ API 키가 설정되지 않았습니다: {e}")
     st.info("""
     **[설정 방법]**
     1. **로컬 실행 시**: 프로젝트 폴더 안에 `.streamlit` 폴더를 만들고 `secrets.toml` 파일을 생성하여 키를 입력하세요.
@@ -33,7 +43,7 @@ PUBLIC_NOTION_URL = f"https://{PUBLIC_NOTION_DOMAIN}/2c1576d96adb80bab598f4232e3
 
 # 임베딩 설정
 EMBEDDING_MODEL = "models/text-embedding-004"
-EMBEDDINGS_FILE = "embeddings.json"
+EMBEDDINGS_FILENAME = "embeddings.json"
 
 # =============================================================================
 # 초기화
@@ -45,6 +55,84 @@ if GEMINI_API_KEY.startswith("AIza"):
     genai.configure(api_key=GEMINI_API_KEY)
 else:
     st.warning("⚠️ API 키 형식이 올바르지 않습니다.")
+
+# =============================================================================
+# Google Drive 함수
+# =============================================================================
+
+def get_drive_service():
+    """Google Drive API 서비스 객체 생성"""
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            dict(GDRIVE_SERVICE_ACCOUNT),
+            scopes=['https://www.googleapis.com/auth/drive.file']
+        )
+        service = build('drive', 'v3', credentials=creds)
+        return service
+    except Exception as e:
+        st.error(f"Google Drive 연결 실패: {e}")
+        return None
+
+
+def find_file_in_drive(service, filename, folder_id):
+    """Drive 폴더에서 파일 찾기"""
+    try:
+        query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
+        results = service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        return files[0]['id'] if files else None
+    except Exception as e:
+        st.warning(f"파일 검색 실패: {e}")
+        return None
+
+
+def download_from_drive(service, file_id):
+    """Drive에서 파일 다운로드"""
+    try:
+        request = service.files().get_media(fileId=file_id)
+        file_buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_buffer, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        file_buffer.seek(0)
+        return json.load(file_buffer)
+    except Exception as e:
+        st.warning(f"파일 다운로드 실패: {e}")
+        return None
+
+
+def upload_to_drive(service, data, filename, folder_id, file_id=None):
+    """Drive에 파일 업로드 (새로 생성 또는 업데이트)"""
+    try:
+        file_buffer = io.BytesIO()
+        json_str = json.dumps(data, ensure_ascii=False)
+        file_buffer.write(json_str.encode('utf-8'))
+        file_buffer.seek(0)
+        
+        media = MediaIoBaseUpload(file_buffer, mimetype='application/json', resumable=True)
+        
+        if file_id:
+            updated_file = service.files().update(
+                fileId=file_id,
+                media_body=media
+            ).execute()
+            return updated_file['id']
+        else:
+            file_metadata = {
+                'name': filename,
+                'parents': [folder_id]
+            }
+            created_file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            return created_file['id']
+    except Exception as e:
+        st.error(f"파일 업로드 실패: {e}")
+        return None
+
 
 # =============================================================================
 # AI 프롬프트
@@ -190,40 +278,47 @@ GBS_PROMPT_TEMPLATE = """
 # 임베딩 관련 함수
 # =============================================================================
 
-def load_embeddings():
-    """저장된 임베딩 파일 로드 (session_state 활용)"""
-    # 이미 메모리에 있으면 재사용
-    if 'embeddings_cache' in st.session_state:
-        return st.session_state['embeddings_cache']
+def load_embeddings_from_drive():
+    """Google Drive에서 임베딩 로드"""
+    if 'embeddings_cache' in st.session_state and st.session_state['embeddings_cache']:
+        return st.session_state['embeddings_cache'], st.session_state.get('embeddings_file_id')
     
-    if Path(EMBEDDINGS_FILE).exists():
-        try:
-            with open(EMBEDDINGS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                embeddings = data.get('embeddings', [])
-                st.session_state['embeddings_cache'] = embeddings
-                return embeddings
-        except:
-            pass
-    return []
+    service = get_drive_service()
+    if not service:
+        return [], None
+    
+    file_id = find_file_in_drive(service, EMBEDDINGS_FILENAME, GDRIVE_FOLDER_ID)
+    if file_id:
+        data = download_from_drive(service, file_id)
+        if data:
+            embeddings = data.get('embeddings', [])
+            st.session_state['embeddings_cache'] = embeddings
+            st.session_state['embeddings_file_id'] = file_id
+            return embeddings, file_id
+    
+    return [], None
 
 
-def save_embeddings(embeddings_data):
-    """임베딩 파일 저장"""
-    try:
-        with open(EMBEDDINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                "version": "1.0",
-                "model": EMBEDDING_MODEL,
-                "count": len(embeddings_data),
-                "embeddings": embeddings_data
-            }, f, ensure_ascii=False)
-        # 캐시도 업데이트
+def save_embeddings_to_drive(embeddings_data, file_id=None):
+    """Google Drive에 임베딩 저장"""
+    service = get_drive_service()
+    if not service:
+        return None
+    
+    data = {
+        "version": "1.0",
+        "model": EMBEDDING_MODEL,
+        "count": len(embeddings_data),
+        "embeddings": embeddings_data
+    }
+    
+    new_file_id = upload_to_drive(service, data, EMBEDDINGS_FILENAME, GDRIVE_FOLDER_ID, file_id)
+    
+    if new_file_id:
         st.session_state['embeddings_cache'] = embeddings_data
-        return True
-    except Exception as e:
-        st.warning(f"임베딩 저장 실패: {e}")
-        return False
+        st.session_state['embeddings_file_id'] = new_file_id
+    
+    return new_file_id
 
 
 def get_embedding(text, max_retries=3):
@@ -294,12 +389,10 @@ def semantic_search(query_text, embeddings_data, top_k=30):
     if not embeddings_data:
         return []
     
-    # 쿼리 임베딩 생성
     query_embedding = get_query_embedding(query_text)
     if not query_embedding:
         return []
     
-    # 유사도 계산
     results = []
     for item in embeddings_data:
         if 'embedding' in item and item['embedding']:
@@ -309,9 +402,7 @@ def semantic_search(query_text, embeddings_data, top_k=30):
                 'similarity': similarity
             })
     
-    # 유사도순 정렬
     results.sort(key=lambda x: x['similarity'], reverse=True)
-    
     return results[:top_k]
 
 
@@ -374,7 +465,6 @@ def fetch_all_illustrations_from_notion():
         
         source_url = props.get('URL', {}).get('url', "")
         
-        # 설교자 추출
         preacher_prop = props.get('설교자', {})
         preacher = ""
         if preacher_prop.get('type') == 'select' and preacher_prop.get('select'):
@@ -403,7 +493,6 @@ def generate_all_embeddings(notion_data, progress_placeholder):
     total = len(notion_data)
     
     for i, item in enumerate(notion_data):
-        # 진행률 업데이트
         progress = (i + 1) / total
         progress_placeholder.progress(progress, text=f"🧠 임베딩 생성 중... {i+1}/{total} ({progress:.0%})")
         
@@ -422,14 +511,13 @@ def generate_all_embeddings(notion_data, progress_placeholder):
                 "embedding": embedding
             })
         
-        # Rate limit 방지 (분당 1500 요청 제한 고려)
         if (i + 1) % 30 == 0:
             time.sleep(1)
     
     return embeddings_data
 
 
-def sync_embeddings_with_notion(notion_data, embeddings_data):
+def sync_embeddings_with_notion(notion_data, embeddings_data, file_id):
     """노션 데이터와 임베딩 동기화 (새 예화만 추가)"""
     existing_ids = {item['id'] for item in embeddings_data}
     new_items = [item for item in notion_data if item['id'] not in existing_ids]
@@ -437,7 +525,6 @@ def sync_embeddings_with_notion(notion_data, embeddings_data):
     if not new_items:
         return embeddings_data, 0
     
-    # 새 예화에 대한 임베딩 생성
     new_embeddings = []
     for item in new_items:
         embed_text = create_embedding_text(item)
@@ -455,15 +542,12 @@ def sync_embeddings_with_notion(notion_data, embeddings_data):
                 "embedding": embedding
             })
         
-        # Rate limit 방지
         time.sleep(0.1)
     
-    # 기존 데이터에 새 임베딩 추가
     updated_data = embeddings_data + new_embeddings
     
-    # 파일 저장
     if new_embeddings:
-        save_embeddings(updated_data)
+        save_embeddings_to_drive(updated_data, file_id)
     
     return updated_data, len(new_embeddings)
 
@@ -570,23 +654,24 @@ def fetch_page_content(page_id):
 # =============================================================================
 
 def main():
-    # 임베딩 초기화 체크
-    embeddings_data = load_embeddings()
+    # Google Drive에서 임베딩 로드
+    embeddings_data, file_id = load_embeddings_from_drive()
     needs_initial_setup = len(embeddings_data) == 0
     
     with st.sidebar:
         st.markdown("### 🕊️ Sermon Assistant Pro")
-        st.info("임베딩 기반 검색 v2.0")
+        st.info("임베딩 기반 검색 v2.0\n(Google Drive 저장)")
         st.markdown("---")
         st.link_button("📚 전체 예화 도서관(Notion) 가기", PUBLIC_NOTION_URL)
         
-        # 임베딩 상태 표시
         st.caption(f"📊 임베딩 보유: {len(embeddings_data)}개")
         
         if st.button("🔄 데이터 새로고침"):
             st.cache_data.clear()
             if 'embeddings_cache' in st.session_state:
                 del st.session_state['embeddings_cache']
+            if 'embeddings_file_id' in st.session_state:
+                del st.session_state['embeddings_file_id']
             st.rerun()
 
     st.title("🕊️ 설교 비서: 예화 & GBS 메이커")
@@ -597,12 +682,11 @@ def main():
     # ==========================================================================
     if needs_initial_setup:
         st.warning("⚠️ 임베딩 데이터가 없습니다. 최초 1회 생성이 필요합니다.")
-        st.info("예화 5,000개 기준 약 5-10분 소요됩니다. 이후에는 자동으로 동기화됩니다.")
+        st.info("예화 5,000개 기준 약 5-10분 소요됩니다. 생성된 데이터는 Google Drive에 저장되어 모든 사용자가 공유합니다.")
         
         if st.button("🚀 임베딩 생성 시작", type="primary"):
             st.markdown("---")
             
-            # 1. 노션에서 데이터 가져오기
             with st.spinner("📚 노션에서 예화 데이터를 가져오는 중..."):
                 notion_data = fetch_all_illustrations_from_notion()
             
@@ -612,22 +696,23 @@ def main():
             
             st.success(f"✅ {len(notion_data)}개 예화 로드 완료!")
             
-            # 2. 임베딩 생성
             st.markdown("### 🧠 임베딩 생성 중...")
             progress_bar = st.empty()
             
             embeddings_data = generate_all_embeddings(notion_data, progress_bar)
             
-            # 3. 저장
-            if save_embeddings(embeddings_data):
+            st.markdown("### 💾 Google Drive에 저장 중...")
+            new_file_id = save_embeddings_to_drive(embeddings_data)
+            
+            if new_file_id:
                 st.success(f"✅ {len(embeddings_data)}개 임베딩 생성 및 저장 완료!")
                 st.balloons()
                 time.sleep(2)
                 st.rerun()
             else:
-                st.error("임베딩 저장 실패")
+                st.error("Google Drive 저장 실패")
         
-        return  # 임베딩 없으면 여기서 종료
+        return
     
     # ==========================================================================
     # 정상 UI
@@ -639,7 +724,7 @@ def main():
         3. **분석 시작**: 버튼을 누르면 모든 작업이 자동으로 진행됩니다.
         
         ---
-        **🆕 v2.0 업데이트**: 임베딩 기반 의미 검색으로 더 정확한 예화 추천!
+        **🆕 v2.0 업데이트**: 임베딩 기반 의미 검색 + Google Drive 저장!
         """)
 
     col1, col2 = st.columns([1, 1])
@@ -655,10 +740,10 @@ def main():
         with col2:
             st.subheader("📊 분석 결과")
             
-            # 0. 임베딩 동기화 (새 예화 확인)
+            # 0. 임베딩 동기화
             with st.status("📚 예화 데이터 동기화 중...") as status:
                 notion_data = fetch_all_illustrations_from_notion()
-                embeddings_data, new_count = sync_embeddings_with_notion(notion_data, embeddings_data)
+                embeddings_data, new_count = sync_embeddings_with_notion(notion_data, embeddings_data, file_id)
                 
                 if new_count > 0:
                     status.update(label=f"✅ {new_count}개 새 예화 임베딩 추가!", state="complete")
@@ -675,14 +760,12 @@ def main():
             
             # 2. 예화 추천 (임베딩 기반)
             with st.status("📚 의미 기반으로 가장 적절한 예화를 찾습니다...") as status:
-                # 검색 쿼리 생성
                 search_query = analysis_result.get('설교요약', '')
                 if analysis_result.get('핵심주제'):
                     search_query += " " + " ".join(analysis_result['핵심주제'])
                 if analysis_result.get('감정선'):
                     search_query += " " + " ".join(analysis_result['감정선'])
                 
-                # 의미 기반 검색
                 top_candidates = semantic_search(search_query, embeddings_data, top_k=30)
 
                 recommendation_result = None
@@ -704,7 +787,6 @@ def main():
             with st.status(f"✍️ {target_dept} 맞춤형 교재와 피드백을 작성 중입니다...") as status:
                 feedback_result = get_gemini_json(FEEDBACK_PROMPT.format(draft=sermon_draft))
                 
-                # 부서별 프롬프트 설정
                 if target_dept == "청년부":
                     age_range = "20~30대 대학생/직장인"
                     dept_characteristics = "권위적인 가르침보다 진정성 있는 나눔 선호, 구체적 삶의 적용 원함"
@@ -717,7 +799,7 @@ def main():
                     age_range = "10대 청소년"
                     dept_characteristics = "학업 스트레스와 정체성 고민, 짧고 임팩트 있는 메시지 선호"
                     tone_manner = "에너지 넘치고 짧고 간결한 어조"
-                else:  # 유초등부
+                else:
                     age_range = "초등학생"
                     dept_characteristics = "활동적이고 쉬운 언어 필요, 스토리텔링 중요"
                     tone_manner = "다정하고 쉬운 선생님 말투 (존댓말 사용)"
