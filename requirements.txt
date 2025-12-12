@@ -3,3 +3,5 @@ pandas
 requests
 google-generativeai
 numpy
+google-api-python-client
+google-auth
