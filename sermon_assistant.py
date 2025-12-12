@@ -5,14 +5,13 @@ import google.generativeai as genai
 import json
 import re
 import time
+import numpy as np
 from urllib.parse import urlparse, parse_qs
+from pathlib import Path
 
 # =============================================================================
 # 🔐 보안 설정 (Security Setup)
 # =============================================================================
-# API 키는 이제 코드에 직접 적지 않고, Streamlit의 'Secrets' 기능을 통해 불러옵니다.
-# 로컬 실행 시: .streamlit/secrets.toml 파일 필요
-# 클라우드 실행 시: Streamlit Cloud 대시보드의 Secrets 메뉴 설정 필요
 
 try:
     NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
@@ -32,20 +31,23 @@ except (FileNotFoundError, KeyError):
 PUBLIC_NOTION_DOMAIN = "greation83.notion.site"
 PUBLIC_NOTION_URL = f"https://{PUBLIC_NOTION_DOMAIN}/2c1576d96adb80bab598f4232e364f3f?v=2c1576d96adb80bba8dc000cee9827e8"
 
+# 임베딩 설정
+EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDINGS_FILE = "embeddings.json"
+
 # =============================================================================
 # 초기화
 # =============================================================================
 
 st.set_page_config(layout="wide", page_title="설교 비서 Pro (Cloud)")
 
-# 유료 키 설정
 if GEMINI_API_KEY.startswith("AIza"):
     genai.configure(api_key=GEMINI_API_KEY)
 else:
     st.warning("⚠️ API 키 형식이 올바르지 않습니다.")
 
 # =============================================================================
-# AI 프롬프트 (심층 분석 및 GBS)
+# AI 프롬프트
 # =============================================================================
 
 ANALYSIS_PROMPT = """
@@ -115,7 +117,8 @@ RECOMMENDATION_PROMPT = """
 예를 들어, 설교가 '고난 중의 인내'를 다룬다면, '가벼운 유머'보다는 '깊이 있는 간증'이나 '역사적 사례'를 추천하세요.
 
 ## 중요: 
-반드시 후보 예화 목록에 있는 **'번호(ID)'**를 함께 출력해주세요.
+- 반드시 후보 예화 목록에 있는 **'번호(ID)'**를 함께 출력해주세요.
+- **동일한 설교자의 예화는 최대 3개**까지만 추천하세요. 다양한 출처의 예화를 선정해주세요.
 
 ## 출력 형식 (JSON):
 {{
@@ -184,7 +187,289 @@ GBS_PROMPT_TEMPLATE = """
 """
 
 # =============================================================================
-# 함수 정의
+# 임베딩 관련 함수
+# =============================================================================
+
+def load_embeddings():
+    """저장된 임베딩 파일 로드 (session_state 활용)"""
+    # 이미 메모리에 있으면 재사용
+    if 'embeddings_cache' in st.session_state:
+        return st.session_state['embeddings_cache']
+    
+    if Path(EMBEDDINGS_FILE).exists():
+        try:
+            with open(EMBEDDINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                embeddings = data.get('embeddings', [])
+                st.session_state['embeddings_cache'] = embeddings
+                return embeddings
+        except:
+            pass
+    return []
+
+
+def save_embeddings(embeddings_data):
+    """임베딩 파일 저장"""
+    try:
+        with open(EMBEDDINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                "version": "1.0",
+                "model": EMBEDDING_MODEL,
+                "count": len(embeddings_data),
+                "embeddings": embeddings_data
+            }, f, ensure_ascii=False)
+        # 캐시도 업데이트
+        st.session_state['embeddings_cache'] = embeddings_data
+        return True
+    except Exception as e:
+        st.warning(f"임베딩 저장 실패: {e}")
+        return False
+
+
+def get_embedding(text, max_retries=3):
+    """Gemini 임베딩 생성"""
+    for attempt in range(max_retries):
+        try:
+            result = genai.embed_content(
+                model=EMBEDDING_MODEL,
+                content=text,
+                task_type="retrieval_document"
+            )
+            return result['embedding']
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                return None
+    return None
+
+
+def get_query_embedding(text):
+    """검색 쿼리용 임베딩 생성"""
+    try:
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=text,
+            task_type="retrieval_query"
+        )
+        return result['embedding']
+    except Exception as e:
+        st.warning(f"쿼리 임베딩 생성 실패: {e}")
+        return None
+
+
+def cosine_similarity(a, b):
+    """코사인 유사도 계산"""
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def create_embedding_text(illust):
+    """임베딩용 텍스트 생성"""
+    parts = [illust.get('title', '')]
+    
+    if illust.get('summary'):
+        parts.append(illust['summary'])
+    
+    subjects = illust.get('subjects', [])
+    if subjects:
+        if isinstance(subjects, list):
+            parts.append(", ".join(subjects))
+        else:
+            parts.append(str(subjects))
+    
+    emotions = illust.get('emotions', [])
+    if emotions:
+        if isinstance(emotions, list):
+            parts.append(", ".join(emotions))
+        else:
+            parts.append(str(emotions))
+    
+    return " | ".join(parts)
+
+
+def semantic_search(query_text, embeddings_data, top_k=30):
+    """의미 기반 검색"""
+    if not embeddings_data:
+        return []
+    
+    # 쿼리 임베딩 생성
+    query_embedding = get_query_embedding(query_text)
+    if not query_embedding:
+        return []
+    
+    # 유사도 계산
+    results = []
+    for item in embeddings_data:
+        if 'embedding' in item and item['embedding']:
+            similarity = cosine_similarity(query_embedding, item['embedding'])
+            results.append({
+                **{k: v for k, v in item.items() if k != 'embedding'},
+                'similarity': similarity
+            })
+    
+    # 유사도순 정렬
+    results.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    return results[:top_k]
+
+
+# =============================================================================
+# 노션 관련 함수
+# =============================================================================
+
+@st.cache_data(ttl=3600)
+def fetch_all_illustrations_from_notion():
+    """노션에서 모든 예화 데이터 가져오기"""
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    
+    results = []
+    has_more = True
+    next_cursor = None
+
+    while has_more:
+        try:
+            payload = {"filter": {"property": "종류", "select": {"equals": "예화"}}, "page_size": 100}
+            if next_cursor:
+                payload["start_cursor"] = next_cursor
+            
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code != 200:
+                break
+            
+            data = response.json()
+            results.extend(data.get('results', []))
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor', None)
+        except:
+            break
+    
+    processed_data = []
+    for page in results:
+        props = page.get('properties', {})
+        title_prop = props.get('title', {}).get('title', [])
+        title = title_prop[0].get('plain_text', "") if title_prop else ""
+        
+        subjects = []
+        subject_prop = props.get('주제', {})
+        prop_type = subject_prop.get('type')
+        if prop_type == 'multi_select':
+            subjects = [item.get('name', "") for item in subject_prop.get('multi_select', [])]
+        elif prop_type == 'rich_text':
+            text_list = subject_prop.get('rich_text', [])
+            if text_list:
+                raw_text = text_list[0].get('plain_text', "")
+                subjects = [s.strip() for s in raw_text.split(',') if s.strip()]
+
+        emotions = [item.get('name', "") for item in props.get('감정톤', {}).get('multi_select', [])]
+        
+        summary_prop = props.get('예화요약', {}).get('rich_text', [])
+        summary = summary_prop[0].get('plain_text', "") if summary_prop else ""
+        
+        source_url = props.get('URL', {}).get('url', "")
+        
+        # 설교자 추출
+        preacher_prop = props.get('설교자', {})
+        preacher = ""
+        if preacher_prop.get('type') == 'select' and preacher_prop.get('select'):
+            preacher = preacher_prop['select'].get('name', "")
+        elif preacher_prop.get('type') == 'rich_text':
+            text_list = preacher_prop.get('rich_text', [])
+            if text_list:
+                preacher = text_list[0].get('plain_text', "")
+            
+        processed_data.append({
+            "id": page['id'],
+            "title": title,
+            "subjects": subjects,
+            "emotions": emotions,
+            "summary": summary,
+            "url": page.get('url', ""),
+            "source_url": source_url,
+            "preacher": preacher
+        })
+    return processed_data
+
+
+def generate_all_embeddings(notion_data, progress_placeholder):
+    """모든 예화에 대한 임베딩 생성 (최초 1회)"""
+    embeddings_data = []
+    total = len(notion_data)
+    
+    for i, item in enumerate(notion_data):
+        # 진행률 업데이트
+        progress = (i + 1) / total
+        progress_placeholder.progress(progress, text=f"🧠 임베딩 생성 중... {i+1}/{total} ({progress:.0%})")
+        
+        embed_text = create_embedding_text(item)
+        embedding = get_embedding(embed_text)
+        
+        if embedding:
+            embeddings_data.append({
+                "id": item['id'],
+                "title": item['title'],
+                "summary": item['summary'],
+                "subjects": item['subjects'],
+                "emotions": item['emotions'],
+                "source_url": item['source_url'],
+                "preacher": item.get('preacher', ''),
+                "embedding": embedding
+            })
+        
+        # Rate limit 방지 (분당 1500 요청 제한 고려)
+        if (i + 1) % 30 == 0:
+            time.sleep(1)
+    
+    return embeddings_data
+
+
+def sync_embeddings_with_notion(notion_data, embeddings_data):
+    """노션 데이터와 임베딩 동기화 (새 예화만 추가)"""
+    existing_ids = {item['id'] for item in embeddings_data}
+    new_items = [item for item in notion_data if item['id'] not in existing_ids]
+    
+    if not new_items:
+        return embeddings_data, 0
+    
+    # 새 예화에 대한 임베딩 생성
+    new_embeddings = []
+    for item in new_items:
+        embed_text = create_embedding_text(item)
+        embedding = get_embedding(embed_text)
+        
+        if embedding:
+            new_embeddings.append({
+                "id": item['id'],
+                "title": item['title'],
+                "summary": item['summary'],
+                "subjects": item['subjects'],
+                "emotions": item['emotions'],
+                "source_url": item['source_url'],
+                "preacher": item.get('preacher', ''),
+                "embedding": embedding
+            })
+        
+        # Rate limit 방지
+        time.sleep(0.1)
+    
+    # 기존 데이터에 새 임베딩 추가
+    updated_data = embeddings_data + new_embeddings
+    
+    # 파일 저장
+    if new_embeddings:
+        save_embeddings(updated_data)
+    
+    return updated_data, len(new_embeddings)
+
+
+# =============================================================================
+# 기타 함수
 # =============================================================================
 
 def get_gemini_response(prompt, model_name='gemini-2.5-flash'):
@@ -202,6 +487,7 @@ def get_gemini_response(prompt, model_name='gemini-2.5-flash'):
     except Exception as e:
         return None
 
+
 def get_gemini_json(prompt):
     """Gemini API 호출 (JSON 반환)"""
     text = get_gemini_response(prompt)
@@ -214,87 +500,34 @@ def get_gemini_json(prompt):
                 pass
     return None
 
+
 def convert_to_public_url(page_id):
-    if not page_id: return PUBLIC_NOTION_URL
+    if not page_id:
+        return PUBLIC_NOTION_URL
     clean_id = page_id.replace("-", "")
     return f"https://{PUBLIC_NOTION_DOMAIN}/{clean_id}"
+
 
 def extract_start_time(url):
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
-        if 't' in qs: return int(qs['t'][0])
-    except: pass
+        if 't' in qs:
+            return int(qs['t'][0])
+    except:
+        pass
     return 0
 
-# 🔥 함수 이름 변경으로 강제 캐시 갱신 (v6 - DB 변경)
-@st.cache_data(ttl=3600) 
-def fetch_all_illustrations_v6():
-    """Notion에서 모든 예화 데이터 가져오기"""
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    headers = {"Authorization": f"Bearer {NOTION_API_KEY}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
-    
-    results = []
-    has_more = True
-    next_cursor = None
 
-    with st.spinner("📚 서재(Notion)에서 최신 데이터를 가져오는 중..."):
-        while has_more:
-            try:
-                payload = {"filter": {"property": "종류", "select": {"equals": "예화"}}, "page_size": 100}
-                if next_cursor: payload["start_cursor"] = next_cursor
-                
-                response = requests.post(url, headers=headers, json=payload)
-                if response.status_code != 200: break
-                
-                data = response.json()
-                results.extend(data.get('results', []))
-                has_more = data.get('has_more', False)
-                next_cursor = data.get('next_cursor', None)
-            except: break
-    
-    processed_data = []
-    for page in results:
-        props = page.get('properties', {})
-        title_prop = props.get('title', {}).get('title', [])
-        title = title_prop[0].get('plain_text', "") if title_prop else ""
-        
-        subjects = []
-        subject_prop = props.get('주제', {})
-        prop_type = subject_prop.get('type')
-
-        if prop_type == 'multi_select':
-            subjects = [item.get('name', "") for item in subject_prop.get('multi_select', [])]
-        elif prop_type == 'rich_text':
-            text_list = subject_prop.get('rich_text', [])
-            if text_list:
-                raw_text = text_list[0].get('plain_text', "")
-                subjects = [s.strip() for s in raw_text.split(',') if s.strip()]
-
-        emotions = [item.get('name', "") for item in props.get('감정톤', {}).get('multi_select', [])]
-        
-        summary_prop = props.get('예화요약', {}).get('rich_text', [])
-        summary = summary_prop[0].get('plain_text', "") if summary_prop else ""
-        
-        source_url = props.get('URL', {}).get('url', "") 
-            
-        processed_data.append({
-            "id": page['id'],
-            "title": title,
-            "subjects": subjects,
-            "emotions": emotions,
-            "summary": summary,
-            "url": page.get('url', ""),
-            "source_url": source_url
-        })
-    return processed_data
-
-# 🔥 함수 이름 변경으로 강제 캐시 갱신 (v6 - DB 변경)
 @st.cache_data(ttl=3600)
-def fetch_page_content_v6(page_id):
+def fetch_page_content(page_id):
     """특정 페이지의 본문(Block) 내용을 가져와 텍스트로 변환"""
     url = f"https://api.notion.com/v1/blocks/{page_id}/children"
-    headers = {"Authorization": f"Bearer {NOTION_API_KEY}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
     
     content_text = ""
     try:
@@ -311,53 +544,102 @@ def fetch_page_content_v6(page_id):
                         text_content += rt.get('plain_text', "")
                     
                     if text_content:
-                        if b_type == 'heading_1': content_text += f"\n# {text_content}\n"
-                        elif b_type == 'heading_2': content_text += f"\n## {text_content}\n"
-                        elif b_type == 'heading_3': content_text += f"\n### {text_content}\n"
-                        elif b_type == 'bulleted_list_item': content_text += f"• {text_content}\n"
-                        elif b_type == 'numbered_list_item': content_text += f"1. {text_content}\n"
-                        elif b_type == 'quote': content_text += f"\n> {text_content}\n"
-                        else: content_text += f"{text_content}\n\n"
-        else: return "(본문을 가져오는데 실패했습니다.)"
-    except: return "(본문 로드 중 오류 발생)"
+                        if b_type == 'heading_1':
+                            content_text += f"\n# {text_content}\n"
+                        elif b_type == 'heading_2':
+                            content_text += f"\n## {text_content}\n"
+                        elif b_type == 'heading_3':
+                            content_text += f"\n### {text_content}\n"
+                        elif b_type == 'bulleted_list_item':
+                            content_text += f"• {text_content}\n"
+                        elif b_type == 'numbered_list_item':
+                            content_text += f"1. {text_content}\n"
+                        elif b_type == 'quote':
+                            content_text += f"\n> {text_content}\n"
+                        else:
+                            content_text += f"{text_content}\n\n"
+        else:
+            return "(본문을 가져오는데 실패했습니다.)"
+    except:
+        return "(본문 로드 중 오류 발생)"
     return content_text if content_text else "(본문 내용이 없습니다.)"
 
-def calculate_relevance_score(illustration, sermon_analysis):
-    score = 0
-    if not illustration['subjects'] or not sermon_analysis.get('핵심주제'): pass 
-    else:
-        matches = set(illustration['subjects']) & set(sermon_analysis['핵심주제'])
-        score += len(matches) * 5
-    if illustration['emotions'] and sermon_analysis.get('감정선'):
-        emo_matches = set(illustration['emotions']) & set(sermon_analysis['감정선'])
-        score += len(emo_matches) * 3
-    full_text = (illustration['title'] + " " + illustration['summary']).replace(" ", "")
-    for keyword in sermon_analysis.get('핵심주제', []):
-        if keyword in full_text: score += 1
-    return score
 
 # =============================================================================
 # 메인 UI
 # =============================================================================
 
 def main():
+    # 임베딩 초기화 체크
+    embeddings_data = load_embeddings()
+    needs_initial_setup = len(embeddings_data) == 0
+    
     with st.sidebar:
         st.markdown("### 🕊️ Sermon Assistant Pro")
-        st.info("유료 API 모드 (Cloud)")
+        st.info("임베딩 기반 검색 v2.0")
         st.markdown("---")
         st.link_button("📚 전체 예화 도서관(Notion) 가기", PUBLIC_NOTION_URL)
-        if st.button("🔄 데이터 새로고침 (캐시 삭제)"):
+        
+        # 임베딩 상태 표시
+        st.caption(f"📊 임베딩 보유: {len(embeddings_data)}개")
+        
+        if st.button("🔄 데이터 새로고침"):
             st.cache_data.clear()
+            if 'embeddings_cache' in st.session_state:
+                del st.session_state['embeddings_cache']
             st.rerun()
 
     st.title("🕊️ 설교 비서: 예화 & GBS 메이커")
     st.markdown("설교 초안을 넣으면 **예화 추천, 설교 클리닉, 그리고 소그룹 교재**까지 한 번에 제작합니다.")
 
+    # ==========================================================================
+    # 최초 실행 시 임베딩 생성
+    # ==========================================================================
+    if needs_initial_setup:
+        st.warning("⚠️ 임베딩 데이터가 없습니다. 최초 1회 생성이 필요합니다.")
+        st.info("예화 5,000개 기준 약 5-10분 소요됩니다. 이후에는 자동으로 동기화됩니다.")
+        
+        if st.button("🚀 임베딩 생성 시작", type="primary"):
+            st.markdown("---")
+            
+            # 1. 노션에서 데이터 가져오기
+            with st.spinner("📚 노션에서 예화 데이터를 가져오는 중..."):
+                notion_data = fetch_all_illustrations_from_notion()
+            
+            if not notion_data:
+                st.error("노션에서 데이터를 가져오지 못했습니다. API 키를 확인하세요.")
+                return
+            
+            st.success(f"✅ {len(notion_data)}개 예화 로드 완료!")
+            
+            # 2. 임베딩 생성
+            st.markdown("### 🧠 임베딩 생성 중...")
+            progress_bar = st.empty()
+            
+            embeddings_data = generate_all_embeddings(notion_data, progress_bar)
+            
+            # 3. 저장
+            if save_embeddings(embeddings_data):
+                st.success(f"✅ {len(embeddings_data)}개 임베딩 생성 및 저장 완료!")
+                st.balloons()
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error("임베딩 저장 실패")
+        
+        return  # 임베딩 없으면 여기서 종료
+    
+    # ==========================================================================
+    # 정상 UI
+    # ==========================================================================
     with st.expander("ℹ️ 사용 가이드"):
         st.markdown("""
         1. **설교 입력**: 설교 원고를 붙여넣으세요.
         2. **부서 선택**: 교재를 만들 대상을 선택하세요 (청년부 등).
         3. **분석 시작**: 버튼을 누르면 모든 작업이 자동으로 진행됩니다.
+        
+        ---
+        **🆕 v2.0 업데이트**: 임베딩 기반 의미 검색으로 더 정확한 예화 추천!
         """)
 
     col1, col2 = st.columns([1, 1])
@@ -370,11 +652,18 @@ def main():
         analyze_btn = st.button("🚀 분석 및 교재 생성 시작", type="primary")
 
     if analyze_btn and sermon_draft:
-        # v6 함수 사용 (캐시 갱신용)
-        illustrations = fetch_all_illustrations_v6()
-        
         with col2:
             st.subheader("📊 분석 결과")
+            
+            # 0. 임베딩 동기화 (새 예화 확인)
+            with st.status("📚 예화 데이터 동기화 중...") as status:
+                notion_data = fetch_all_illustrations_from_notion()
+                embeddings_data, new_count = sync_embeddings_with_notion(notion_data, embeddings_data)
+                
+                if new_count > 0:
+                    status.update(label=f"✅ {new_count}개 새 예화 임베딩 추가!", state="complete")
+                else:
+                    status.update(label=f"✅ 예화 {len(embeddings_data)}개 준비 완료", state="complete")
             
             # 1. 설교 분석
             with st.status("🔍 설교를 분석하고 주제를 추출합니다...") as status:
@@ -384,25 +673,24 @@ def main():
                     return
                 status.update(label="✅ 설교 분석 완료!", state="complete")
             
-            # 2. 예화 추천
-            with st.status("📚 서재에서 가장 적절한 예화를 찾습니다...") as status:
-                top_candidates = []
-                if illustrations:
-                    scored_candidates = []
-                    for illust in illustrations:
-                        score = calculate_relevance_score(illust, analysis_result)
-                        # score > 0 조건 삭제: 점수가 0이어도 AI에게 판단을 맡기기 위함
-                        illust['score'] = score
-                        scored_candidates.append(illust)
-                    
-                    # 점수순 정렬 후 상위 30개 (점수가 모두 0이라도 상위 30개를 가져감)
-                    top_candidates = sorted(scored_candidates, key=lambda x: x['score'], reverse=True)[:30]
+            # 2. 예화 추천 (임베딩 기반)
+            with st.status("📚 의미 기반으로 가장 적절한 예화를 찾습니다...") as status:
+                # 검색 쿼리 생성
+                search_query = analysis_result.get('설교요약', '')
+                if analysis_result.get('핵심주제'):
+                    search_query += " " + " ".join(analysis_result['핵심주제'])
+                if analysis_result.get('감정선'):
+                    search_query += " " + " ".join(analysis_result['감정선'])
+                
+                # 의미 기반 검색
+                top_candidates = semantic_search(search_query, embeddings_data, top_k=30)
 
                 recommendation_result = None
                 if top_candidates:
                     candidates_text = ""
                     for idx, cand in enumerate(top_candidates):
-                        candidates_text += f"{idx+1}. 제목: {cand['title']} | 요약: {cand['summary']} | 태그: {cand['subjects']}\n"
+                        preacher_info = f" | 설교자: {cand.get('preacher', '미상')}" if cand.get('preacher') else ""
+                        candidates_text += f"{idx+1}. 제목: {cand['title']} | 요약: {cand.get('summary', '')} | 태그: {cand.get('subjects', [])}{preacher_info}\n"
                     
                     curation_prompt = RECOMMENDATION_PROMPT.format(
                         sermon_summary=analysis_result['설교요약'],
@@ -421,29 +709,24 @@ def main():
                     age_range = "20~30대 대학생/직장인"
                     dept_characteristics = "권위적인 가르침보다 진정성 있는 나눔 선호, 구체적 삶의 적용 원함"
                     tone_manner = "친근하고 위트 있으면서도 핵심을 찌르는 어조 (MZ/Alpha 감성)"
-                    quiz_difficulty = "중학생~청년 초신자도 풀 수 있는 수준"
                 elif target_dept == "장년부":
                     age_range = "40~60대 성인"
                     dept_characteristics = "삶의 연륜이 있으며 가정과 직장의 무게를 견디는 세대, 깊은 위로와 통찰 필요"
                     tone_manner = "정중하고 깊이 있으며 목회적 돌봄이 느껴지는 어조"
-                    quiz_difficulty = "성경 지식을 확인할 수 있는 수준"
                 elif target_dept == "중고등부":
                     age_range = "10대 청소년"
                     dept_characteristics = "학업 스트레스와 정체성 고민, 짧고 임팩트 있는 메시지 선호"
                     tone_manner = "에너지 넘치고 짧고 간결한 어조"
-                    quiz_difficulty = "쉽고 재미있는 수준"
-                else: # 유초등부
+                else:  # 유초등부
                     age_range = "초등학생"
                     dept_characteristics = "활동적이고 쉬운 언어 필요, 스토리텔링 중요"
                     tone_manner = "다정하고 쉬운 선생님 말투 (존댓말 사용)"
-                    quiz_difficulty = "아주 쉬움 (OX 퀴즈 위주)"
 
                 gbs_prompt = GBS_PROMPT_TEMPLATE.format(
                     target_dept=target_dept,
                     age_range=age_range,
                     dept_characteristics=dept_characteristics,
                     tone_manner=tone_manner,
-                    quiz_difficulty=quiz_difficulty,
                     draft=sermon_draft
                 )
                 
@@ -463,15 +746,20 @@ def main():
                                 candidate_index = rec['번호'] - 1
                                 if 0 <= candidate_index < len(top_candidates):
                                     original_data = top_candidates[candidate_index]
-                            except: pass
+                            except:
+                                pass
                         if not original_data:
                             original_data = next((item for item in top_candidates if item["title"] == rec["제목"]), None)
 
                         with st.container():
-                            st.markdown(f"#### 📌 {rec['제목']}")
+                            preacher_badge = f" `{original_data.get('preacher', '')}`" if original_data and original_data.get('preacher') else ""
+                            st.markdown(f"#### 📌 {rec['제목']}{preacher_badge}")
                             st.write(f"**🗣️ 추천 이유:** {rec['추천이유']}")
                             st.caption(f"**💡 활용 팁:** {rec['활용팁']}")
                             if original_data:
+                                if 'similarity' in original_data:
+                                    st.caption(f"📊 의미 유사도: {original_data['similarity']:.2%}")
+                                
                                 with st.expander("📖 예화 본문 & 영상 보기", expanded=(idx == 0)):
                                     with st.spinner("본문을 불러오는 중..."):
                                         if original_data.get('source_url'):
@@ -479,7 +767,6 @@ def main():
                                             st.markdown(f"**📺 관련 설교 영상 (시작 시간: {start_time}초)**")
                                             st.video(original_data['source_url'], start_time=start_time)
                                             
-                                            # [추가] 영상 시간 불일치 시 해결 팁
                                             st.info("""
                                             💡 **예화와 영상 시간이 맞지 않는 경우에는**
                                             1. 영상 링크를 누른 후 
@@ -489,7 +776,7 @@ def main():
                                             """)
                                             
                                         st.divider()
-                                        content_text = fetch_page_content_v6(original_data['id'])
+                                        content_text = fetch_page_content(original_data['id'])
                                         st.markdown(content_text)
                                         st.divider()
                                         public_url = convert_to_public_url(original_data['id'])
@@ -510,9 +797,12 @@ def main():
                     st.markdown("### 📢 설교 논리 & 전달력 클리닉")
                     st.success(f"**👍 강점:** {feedback_result.get('강점', '훌륭한 설교입니다.')}")
                     st.markdown("#### ⚠️ 논리적 점검")
-                    for point in feedback_result.get('논리점검', []): st.markdown(f"- {point}")
+                    for point in feedback_result.get('논리점검', []):
+                        st.markdown(f"- {point}")
                     st.markdown("#### 🏃‍♂️ 구체적 행동 제안 (Action Plan)")
-                    for point in feedback_result.get('보완제안', []): st.markdown(f"- {point}")
+                    for point in feedback_result.get('보완제안', []):
+                        st.markdown(f"- {point}")
+
 
 if __name__ == "__main__":
     main()
