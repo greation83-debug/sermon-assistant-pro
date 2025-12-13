@@ -97,8 +97,13 @@ def semantic_search_supabase(query_embedding, top_k=30):
             }
         )
         
+        # 디버깅 로그
+        st.sidebar.write(f"🔍 검색 응답: {response.status_code}")
+        
         if response.status_code == 200:
             results = response.json()
+            st.sidebar.write(f"🔍 검색 결과 수: {len(results) if results else 0}")
+            
             if results:
                 return results
             else:
@@ -106,7 +111,7 @@ def semantic_search_supabase(query_embedding, top_k=30):
                 st.warning("⚠️ 벡터 검색 결과 없음, 기본 예화를 가져옵니다.")
                 return get_random_illustrations(top_k)
         else:
-            st.warning(f"⚠️ 검색 오류 ({response.status_code}), 기본 예화를 가져옵니다.")
+            st.warning(f"⚠️ 검색 오류 ({response.status_code}): {response.text[:200]}")
             return get_random_illustrations(top_k)
     except Exception as e:
         st.warning(f"⚠️ 검색 실패: {e}, 기본 예화를 가져옵니다.")
@@ -460,6 +465,7 @@ def main():
                 
                 # 쿼리 임베딩 생성
                 query_embedding = get_query_embedding(search_query)
+                st.sidebar.write(f"🔍 임베딩 생성: {'✅' if query_embedding else '❌'}")
                 
                 top_candidates = []
                 if query_embedding:
@@ -468,6 +474,8 @@ def main():
                     # 임베딩 실패시 fallback
                     st.warning("⚠️ 임베딩 생성 실패, 기본 예화를 가져옵니다.")
                     top_candidates = get_random_illustrations(30)
+                
+                st.sidebar.write(f"🔍 후보 예화 수: {len(top_candidates)}")
 
                 recommendation_result = None
                 if top_candidates:
@@ -482,6 +490,7 @@ def main():
                         candidates=candidates_text
                     )
                     recommendation_result = get_gemini_json(curation_prompt)
+                    st.sidebar.write(f"🔍 AI 큐레이션: {'✅' if recommendation_result else '❌'}")
                 status.update(label="✅ 예화 추천 완료!", state="complete")
 
             # 3. 피드백 & GBS 생성
@@ -522,8 +531,22 @@ def main():
             with tab1:
                 st.info(f"**💡 설교 요약:** {analysis_result.get('설교요약', '')}")
                 st.caption("💎 **Tip:** 노션 페이지에 들어가면 이 예화와 비슷한 예화 5개를 추천해 줍니다.")
+                
+                # AI 추천 결과가 있으면 사용, 없으면 top_candidates 직접 표시
                 if recommendation_result and recommendation_result.get('추천목록'):
-                    for idx, rec in enumerate(recommendation_result['추천목록']):
+                    display_list = recommendation_result['추천목록']
+                    use_ai_recommendation = True
+                elif top_candidates:
+                    # AI 추천 실패시 fallback: top_candidates 직접 표시
+                    st.warning("⚠️ AI 큐레이션 실패, 유사도 기반 예화를 표시합니다.")
+                    display_list = [{"번호": i+1, "제목": c['title'], "추천이유": f"설교 내용과 유사도 {c.get('similarity', 0):.1%}", "활용팁": "본문을 확인하고 적절히 활용하세요."} for i, c in enumerate(top_candidates[:15])]
+                    use_ai_recommendation = False
+                else:
+                    display_list = []
+                    use_ai_recommendation = False
+                
+                if display_list:
+                    for idx, rec in enumerate(display_list):
                         original_data = None
                         if '번호' in rec and isinstance(rec['번호'], int):
                             try:
