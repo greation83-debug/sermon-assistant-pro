@@ -67,6 +67,24 @@ def get_illustration_count():
         return 0
 
 
+def get_random_illustrations(count=30):
+    """랜덤 예화 가져오기 (fallback용)"""
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/rest/v1/illustrations?select=id,title,summary,subjects,emotions,source_url,preacher&limit={count}",
+            headers=get_supabase_headers(),
+        )
+        if response.status_code == 200:
+            results = response.json()
+            # similarity 필드 추가 (fallback이므로 0.5로 설정)
+            for item in results:
+                item['similarity'] = 0.5
+            return results
+        return []
+    except:
+        return []
+
+
 def semantic_search_supabase(query_embedding, top_k=30):
     """Supabase 벡터 검색"""
     try:
@@ -80,13 +98,19 @@ def semantic_search_supabase(query_embedding, top_k=30):
         )
         
         if response.status_code == 200:
-            return response.json()
+            results = response.json()
+            if results:
+                return results
+            else:
+                # 결과가 비어있으면 fallback
+                st.warning("⚠️ 벡터 검색 결과 없음, 기본 예화를 가져옵니다.")
+                return get_random_illustrations(top_k)
         else:
-            st.warning(f"검색 오류: {response.status_code}")
-            return []
+            st.warning(f"⚠️ 검색 오류 ({response.status_code}), 기본 예화를 가져옵니다.")
+            return get_random_illustrations(top_k)
     except Exception as e:
-        st.warning(f"검색 실패: {e}")
-        return []
+        st.warning(f"⚠️ 검색 실패: {e}, 기본 예화를 가져옵니다.")
+        return get_random_illustrations(top_k)
 
 
 def get_query_embedding(text):
@@ -99,7 +123,7 @@ def get_query_embedding(text):
         )
         return result['embedding']
     except Exception as e:
-        st.warning(f"쿼리 임베딩 생성 실패: {e}")
+        st.warning(f"⚠️ 쿼리 임베딩 생성 실패: {e}")
         return None
 
 
@@ -440,6 +464,10 @@ def main():
                 top_candidates = []
                 if query_embedding:
                     top_candidates = semantic_search_supabase(query_embedding, top_k=30)
+                else:
+                    # 임베딩 실패시 fallback
+                    st.warning("⚠️ 임베딩 생성 실패, 기본 예화를 가져옵니다.")
+                    top_candidates = get_random_illustrations(30)
 
                 recommendation_result = None
                 if top_candidates:
