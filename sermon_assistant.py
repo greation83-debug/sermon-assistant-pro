@@ -292,16 +292,26 @@ def get_gemini_response(prompt, model_name='gemini-2.5-flash'):
         return None
 
 
-def get_gemini_json(prompt):
-    """Gemini API 호출 (JSON 반환)"""
-    text = get_gemini_response(prompt)
-    if text:
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except: 
-                pass
+def get_gemini_json(prompt, max_retries=3):
+    """Gemini API 호출 (JSON 반환) - 딜레이 + 재시도 포함"""
+    for attempt in range(max_retries):
+        # 딜레이 추가 (첫 시도 제외)
+        if attempt > 0:
+            time.sleep(2)
+        
+        text = get_gemini_response(prompt)
+        if text:
+            match = re.search(r'\{[\s\S]*\}', text)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except:
+                    pass
+        
+        # 재시도 전 대기
+        if attempt < max_retries - 1:
+            time.sleep(1)
+    
     return None
 
 
@@ -455,6 +465,8 @@ def main():
                     return
                 status.update(label="✅ 설교 분석 완료!", state="complete")
             
+            time.sleep(1)  # API Rate Limit 방지
+            
             # 2. 예화 추천 (Supabase 벡터 검색)
             with st.status("📚 의미 기반으로 가장 적절한 예화를 찾습니다...") as status:
                 search_query = analysis_result.get('설교요약', '')
@@ -492,10 +504,14 @@ def main():
                     recommendation_result = get_gemini_json(curation_prompt)
                     st.sidebar.write(f"🔍 AI 큐레이션: {'✅' if recommendation_result else '❌'}")
                 status.update(label="✅ 예화 추천 완료!", state="complete")
+            
+            time.sleep(1)  # API Rate Limit 방지
 
             # 3. 피드백 & GBS 생성
             with st.status(f"✍️ {target_dept} 맞춤형 교재와 피드백을 작성 중입니다...") as status:
                 feedback_result = get_gemini_json(FEEDBACK_PROMPT.format(draft=sermon_draft))
+                
+                time.sleep(1)  # API Rate Limit 방지
                 
                 if target_dept == "청년부":
                     age_range = "20~30대 대학생/직장인"
