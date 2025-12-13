@@ -305,6 +305,8 @@ def fetch_page_content(page_id):
     }
     
     content_text = ""
+    in_related_section = False  # 관련예화 섹션인지 추적
+    
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
@@ -315,11 +317,40 @@ def fetch_page_content(page_id):
                 
                 if b_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'callout', 'quote']:
                     rich_text = block.get(b_type, {}).get('rich_text', [])
+                    
                     for rt in rich_text:
-                        text_content += rt.get('plain_text', "")
+                        plain_text = rt.get('plain_text', "")
+                        
+                        # 링크가 있는 경우 마크다운 링크로 변환
+                        href = rt.get('href', '')
+                        if href and 'notion' in href:
+                            # 노션 링크를 공개 URL로 변환
+                            # 노션 링크에서 페이지 ID 추출
+                            link_page_id = href.split('/')[-1].split('?')[0].split('-')[-1]
+                            if len(link_page_id) == 32:
+                                public_link = f"https://{PUBLIC_NOTION_DOMAIN}/{link_page_id}"
+                                text_content += f"[{plain_text}]({public_link})"
+                            else:
+                                text_content += plain_text
+                        elif href:
+                            text_content += f"[{plain_text}]({href})"
+                        else:
+                            text_content += plain_text
                     
                     if text_content:
-                        if b_type == 'heading_1':
+                        # "관련예화" 섹션 감지
+                        if "관련예화" in text_content or "관련 예화" in text_content:
+                            in_related_section = True
+                            content_text += f"\n---\n### 🔗 {text_content}\n"
+                        # "핵심내용" 감지
+                        elif "핵심내용" in text_content or "핵심 내용" in text_content:
+                            in_related_section = False
+                            content_text += f"\n### 📌 {text_content}\n"
+                        # 관련예화 섹션이 끝나고 본문 시작 (보통 긴 텍스트)
+                        elif in_related_section and len(text_content) > 100:
+                            in_related_section = False
+                            content_text += f"\n---\n### 📖 예화 본문\n\n{text_content}\n\n"
+                        elif b_type == 'heading_1':
                             content_text += f"\n# {text_content}\n"
                         elif b_type == 'heading_2':
                             content_text += f"\n## {text_content}\n"
@@ -352,8 +383,6 @@ def main():
         st.markdown("### 🕊️ Sermon Assistant Pro")
         st.info("Supabase 벡터 검색 v3.0")
         st.markdown("---")
-        st.link_button("📚 전체 예화 도서관(Notion) 가기", PUBLIC_NOTION_URL)
-        
         st.caption(f"📊 예화 DB: {illustration_count:,}개")
         
         if st.button("🔄 캐시 새로고침"):
@@ -464,6 +493,7 @@ def main():
             
             with tab1:
                 st.info(f"**💡 설교 요약:** {analysis_result.get('설교요약', '')}")
+                st.caption("💎 **Tip:** 노션 페이지에 들어가면 이 예화와 비슷한 예화 5개를 추천해 줍니다.")
                 if recommendation_result and recommendation_result.get('추천목록'):
                     for idx, rec in enumerate(recommendation_result['추천목록']):
                         original_data = None
