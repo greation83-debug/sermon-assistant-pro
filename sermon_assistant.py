@@ -7,7 +7,6 @@ import re
 import time
 import numpy as np
 from urllib.parse import urlparse, parse_qs
-from pathlib import Path
 
 # =============================================================================
 # 🔐 보안 설정 (Security Setup)
@@ -17,12 +16,10 @@ try:
     NOTION_API_KEY = st.secrets["NOTION_API_KEY"]
     NOTION_DATABASE_ID = st.secrets["NOTION_DATABASE_ID"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 except (FileNotFoundError, KeyError) as e:
     st.error(f"⚠️ API 키가 설정되지 않았습니다: {e}")
-    st.info("""
-    **[설정 방법]**
-    Streamlit Cloud 설정 페이지의 **Secrets** 란에 키를 입력하세요.
-    """)
     st.stop()
 
 # -----------------------------------------------------------------------------
@@ -32,7 +29,6 @@ PUBLIC_NOTION_URL = f"https://{PUBLIC_NOTION_DOMAIN}/2c1576d96adb80bab598f4232e3
 
 # 임베딩 설정
 EMBEDDING_MODEL = "models/text-embedding-004"
-EMBEDDINGS_FILES = ["embeddings_1.json", "embeddings_2.json"]  # 2개 파일
 
 # =============================================================================
 # 초기화
@@ -44,6 +40,68 @@ if GEMINI_API_KEY.startswith("AIza"):
     genai.configure(api_key=GEMINI_API_KEY)
 else:
     st.warning("⚠️ API 키 형식이 올바르지 않습니다.")
+
+# =============================================================================
+# Supabase 함수
+# =============================================================================
+
+def get_supabase_headers():
+    """Supabase API 헤더"""
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+def get_illustration_count():
+    """Supabase에 저장된 예화 개수 조회"""
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/rest/v1/illustrations?select=id",
+            headers={**get_supabase_headers(), "Prefer": "count=exact"},
+        )
+        count = response.headers.get('content-range', '').split('/')[-1]
+        return int(count) if count else 0
+    except:
+        return 0
+
+
+def semantic_search_supabase(query_embedding, top_k=30):
+    """Supabase 벡터 검색"""
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/match_illustrations",
+            headers=get_supabase_headers(),
+            json={
+                "query_embedding": query_embedding,
+                "match_count": top_k
+            }
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.warning(f"검색 오류: {response.status_code}")
+            return []
+    except Exception as e:
+        st.warning(f"검색 실패: {e}")
+        return []
+
+
+def get_query_embedding(text):
+    """검색 쿼리용 임베딩 생성"""
+    try:
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=text,
+            task_type="retrieval_query"
+        )
+        return result['embedding']
+    except Exception as e:
+        st.warning(f"쿼리 임베딩 생성 실패: {e}")
+        return None
+
 
 # =============================================================================
 # AI 프롬프트
@@ -186,74 +244,6 @@ GBS_PROMPT_TEMPLATE = """
 """
 
 # =============================================================================
-# 임베딩 관련 함수
-# =============================================================================
-
-@st.cache_data(ttl=86400)  # 24시간 캐시
-def load_embeddings():
-    """임베딩 파일들 로드 (2개 파일 합치기)"""
-    all_embeddings = []
-    
-    for filename in EMBEDDINGS_FILES:
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                all_embeddings.extend(data.get('embeddings', []))
-        except FileNotFoundError:
-            st.warning(f"⚠️ {filename} 파일이 없습니다.")
-        except Exception as e:
-            st.warning(f"⚠️ {filename} 로드 실패: {e}")
-    
-    if not all_embeddings:
-        st.error("❌ 임베딩 파일을 찾을 수 없습니다. GitHub에 업로드해주세요.")
-    
-    return all_embeddings
-
-
-def get_query_embedding(text):
-    """검색 쿼리용 임베딩 생성"""
-    try:
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=text,
-            task_type="retrieval_query"
-        )
-        return result['embedding']
-    except Exception as e:
-        st.warning(f"쿼리 임베딩 생성 실패: {e}")
-        return None
-
-
-def cosine_similarity(a, b):
-    """코사인 유사도 계산"""
-    a = np.array(a)
-    b = np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-
-def semantic_search(query_text, embeddings_data, top_k=30):
-    """의미 기반 검색"""
-    if not embeddings_data:
-        return []
-    
-    query_embedding = get_query_embedding(query_text)
-    if not query_embedding:
-        return []
-    
-    results = []
-    for item in embeddings_data:
-        if 'embedding' in item and item['embedding']:
-            similarity = cosine_similarity(query_embedding, item['embedding'])
-            results.append({
-                **{k: v for k, v in item.items() if k != 'embedding'},
-                'similarity': similarity
-            })
-    
-    results.sort(key=lambda x: x['similarity'], reverse=True)
-    return results[:top_k]
-
-
-# =============================================================================
 # 기타 함수
 # =============================================================================
 
@@ -355,16 +345,16 @@ def fetch_page_content(page_id):
 # =============================================================================
 
 def main():
-    # 임베딩 로드
-    embeddings_data = load_embeddings()
+    # Supabase에서 예화 개수 확인
+    illustration_count = get_illustration_count()
     
     with st.sidebar:
         st.markdown("### 🕊️ Sermon Assistant Pro")
-        st.info("임베딩 기반 검색 v2.0")
+        st.info("Supabase 벡터 검색 v3.0")
         st.markdown("---")
         st.link_button("📚 전체 예화 도서관(Notion) 가기", PUBLIC_NOTION_URL)
         
-        st.caption(f"📊 임베딩 보유: {len(embeddings_data)}개")
+        st.caption(f"📊 예화 DB: {illustration_count:,}개")
         
         if st.button("🔄 캐시 새로고침"):
             st.cache_data.clear()
@@ -373,15 +363,9 @@ def main():
     st.title("🕊️ 설교 비서: 예화 & GBS 메이커")
     st.markdown("설교 초안을 넣으면 **예화 추천, 설교 클리닉, 그리고 소그룹 교재**까지 한 번에 제작합니다.")
 
-    # 임베딩 없으면 안내
-    if not embeddings_data:
-        st.error("⚠️ 임베딩 데이터가 없습니다.")
-        st.info("""
-        **해결 방법:**
-        1. `generate_embeddings.py` 스크립트를 로컬에서 실행하여 `embeddings.json` 생성
-        2. 생성된 파일을 GitHub에 업로드
-        3. 앱 재시작
-        """)
+    # DB 체크
+    if illustration_count == 0:
+        st.error("⚠️ Supabase에 예화 데이터가 없습니다.")
         return
 
     # 정상 UI
@@ -413,7 +397,7 @@ def main():
                     return
                 status.update(label="✅ 설교 분석 완료!", state="complete")
             
-            # 2. 예화 추천 (임베딩 기반)
+            # 2. 예화 추천 (Supabase 벡터 검색)
             with st.status("📚 의미 기반으로 가장 적절한 예화를 찾습니다...") as status:
                 search_query = analysis_result.get('설교요약', '')
                 if analysis_result.get('핵심주제'):
@@ -421,7 +405,12 @@ def main():
                 if analysis_result.get('감정선'):
                     search_query += " " + " ".join(analysis_result['감정선'])
                 
-                top_candidates = semantic_search(search_query, embeddings_data, top_k=30)
+                # 쿼리 임베딩 생성
+                query_embedding = get_query_embedding(search_query)
+                
+                top_candidates = []
+                if query_embedding:
+                    top_candidates = semantic_search_supabase(query_embedding, top_k=30)
 
                 recommendation_result = None
                 if top_candidates:
