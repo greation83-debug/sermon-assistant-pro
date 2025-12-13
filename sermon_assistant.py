@@ -24,6 +24,7 @@ try:
     NOTION_DATABASE_ID = st.secrets["NOTION_DATABASE_ID"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     GDRIVE_FOLDER_ID = st.secrets["GDRIVE_FOLDER_ID"]
+    GDRIVE_FILE_ID = st.secrets["GDRIVE_FILE_ID"]  # 파일 ID 직접 지정
     
     # 서비스 계정 JSON 키 (secrets.toml에서 로드)
     GDRIVE_SERVICE_ACCOUNT = st.secrets["GDRIVE_SERVICE_ACCOUNT"]
@@ -43,7 +44,6 @@ PUBLIC_NOTION_URL = f"https://{PUBLIC_NOTION_DOMAIN}/2c1576d96adb80bab598f4232e3
 
 # 임베딩 설정
 EMBEDDING_MODEL = "models/text-embedding-004"
-EMBEDDINGS_FILENAME = "embeddings.json"
 
 # =============================================================================
 # 초기화
@@ -65,24 +65,12 @@ def get_drive_service():
     try:
         creds = service_account.Credentials.from_service_account_info(
             dict(GDRIVE_SERVICE_ACCOUNT),
-            scopes=['https://www.googleapis.com/auth/drive.file']
+            scopes=['https://www.googleapis.com/auth/drive']
         )
         service = build('drive', 'v3', credentials=creds)
         return service
     except Exception as e:
         st.error(f"Google Drive 연결 실패: {e}")
-        return None
-
-
-def find_file_in_drive(service, filename, folder_id):
-    """Drive 폴더에서 파일 찾기"""
-    try:
-        query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get('files', [])
-        return files[0]['id'] if files else None
-    except Exception as e:
-        st.warning(f"파일 검색 실패: {e}")
         return None
 
 
@@ -102,8 +90,8 @@ def download_from_drive(service, file_id):
         return None
 
 
-def upload_to_drive(service, data, filename, folder_id, file_id=None):
-    """Drive에 파일 업로드 (새로 생성 또는 업데이트)"""
+def upload_to_drive(service, data, file_id):
+    """Drive에 파일 업데이트 (기존 파일 덮어쓰기)"""
     try:
         file_buffer = io.BytesIO()
         json_str = json.dumps(data, ensure_ascii=False)
@@ -112,23 +100,13 @@ def upload_to_drive(service, data, filename, folder_id, file_id=None):
         
         media = MediaIoBaseUpload(file_buffer, mimetype='application/json', resumable=True)
         
-        if file_id:
-            updated_file = service.files().update(
-                fileId=file_id,
-                media_body=media
-            ).execute()
-            return updated_file['id']
-        else:
-            file_metadata = {
-                'name': filename,
-                'parents': [folder_id]
-            }
-            created_file = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
-            return created_file['id']
+        # 기존 파일 업데이트
+        updated_file = service.files().update(
+            fileId=file_id,
+            media_body=media
+        ).execute()
+        
+        return updated_file['id']
     except Exception as e:
         st.error(f"파일 업로드 실패: {e}")
         return None
@@ -279,31 +257,29 @@ GBS_PROMPT_TEMPLATE = """
 # =============================================================================
 
 def load_embeddings_from_drive():
-    """Google Drive에서 임베딩 로드"""
+    """Google Drive에서 임베딩 로드 (파일 ID 직접 사용)"""
     if 'embeddings_cache' in st.session_state and st.session_state['embeddings_cache']:
-        return st.session_state['embeddings_cache'], st.session_state.get('embeddings_file_id')
+        return st.session_state['embeddings_cache']
     
     service = get_drive_service()
     if not service:
-        return [], None
+        return []
     
-    file_id = find_file_in_drive(service, EMBEDDINGS_FILENAME, GDRIVE_FOLDER_ID)
-    if file_id:
-        data = download_from_drive(service, file_id)
-        if data:
-            embeddings = data.get('embeddings', [])
-            st.session_state['embeddings_cache'] = embeddings
-            st.session_state['embeddings_file_id'] = file_id
-            return embeddings, file_id
+    # 파일 ID 직접 사용
+    data = download_from_drive(service, GDRIVE_FILE_ID)
+    if data:
+        embeddings = data.get('embeddings', [])
+        st.session_state['embeddings_cache'] = embeddings
+        return embeddings
     
-    return [], None
+    return []
 
 
-def save_embeddings_to_drive(embeddings_data, file_id=None):
-    """Google Drive에 임베딩 저장"""
+def save_embeddings_to_drive(embeddings_data):
+    """Google Drive에 임베딩 저장 (파일 ID 직접 사용)"""
     service = get_drive_service()
     if not service:
-        return None
+        return False
     
     data = {
         "version": "1.0",
@@ -312,13 +288,14 @@ def save_embeddings_to_drive(embeddings_data, file_id=None):
         "embeddings": embeddings_data
     }
     
-    new_file_id = upload_to_drive(service, data, EMBEDDINGS_FILENAME, GDRIVE_FOLDER_ID, file_id)
+    # 파일 ID 직접 사용하여 업데이트
+    result = upload_to_drive(service, data, GDRIVE_FILE_ID)
     
-    if new_file_id:
+    if result:
         st.session_state['embeddings_cache'] = embeddings_data
-        st.session_state['embeddings_file_id'] = new_file_id
+        return True
     
-    return new_file_id
+    return False
 
 
 def get_embedding(text, max_retries=3):
@@ -517,7 +494,7 @@ def generate_all_embeddings(notion_data, progress_placeholder):
     return embeddings_data
 
 
-def sync_embeddings_with_notion(notion_data, embeddings_data, file_id):
+def sync_embeddings_with_notion(notion_data, embeddings_data):
     """노션 데이터와 임베딩 동기화 (새 예화만 추가)"""
     existing_ids = {item['id'] for item in embeddings_data}
     new_items = [item for item in notion_data if item['id'] not in existing_ids]
@@ -547,7 +524,7 @@ def sync_embeddings_with_notion(notion_data, embeddings_data, file_id):
     updated_data = embeddings_data + new_embeddings
     
     if new_embeddings:
-        save_embeddings_to_drive(updated_data, file_id)
+        save_embeddings_to_drive(updated_data)
     
     return updated_data, len(new_embeddings)
 
@@ -655,7 +632,7 @@ def fetch_page_content(page_id):
 
 def main():
     # Google Drive에서 임베딩 로드
-    embeddings_data, file_id = load_embeddings_from_drive()
+    embeddings_data = load_embeddings_from_drive()
     needs_initial_setup = len(embeddings_data) == 0
     
     with st.sidebar:
@@ -670,8 +647,6 @@ def main():
             st.cache_data.clear()
             if 'embeddings_cache' in st.session_state:
                 del st.session_state['embeddings_cache']
-            if 'embeddings_file_id' in st.session_state:
-                del st.session_state['embeddings_file_id']
             st.rerun()
 
     st.title("🕊️ 설교 비서: 예화 & GBS 메이커")
@@ -702,9 +677,7 @@ def main():
             embeddings_data = generate_all_embeddings(notion_data, progress_bar)
             
             st.markdown("### 💾 Google Drive에 저장 중...")
-            new_file_id = save_embeddings_to_drive(embeddings_data)
-            
-            if new_file_id:
+            if save_embeddings_to_drive(embeddings_data):
                 st.success(f"✅ {len(embeddings_data)}개 임베딩 생성 및 저장 완료!")
                 st.balloons()
                 time.sleep(2)
@@ -743,7 +716,7 @@ def main():
             # 0. 임베딩 동기화
             with st.status("📚 예화 데이터 동기화 중...") as status:
                 notion_data = fetch_all_illustrations_from_notion()
-                embeddings_data, new_count = sync_embeddings_with_notion(notion_data, embeddings_data, file_id)
+                embeddings_data, new_count = sync_embeddings_with_notion(notion_data, embeddings_data)
                 
                 if new_count > 0:
                     status.update(label=f"✅ {new_count}개 새 예화 임베딩 추가!", state="complete")
